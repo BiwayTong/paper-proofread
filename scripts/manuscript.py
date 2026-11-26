@@ -20,15 +20,23 @@ SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 class Piece:
     text: str
     nodes: tuple = ()
+    key: bytes = b""
 
 
 @dataclass
 class Block:
     style: str
     context: str
-    pieces: list
+    units: list
     line: int = -1
     protected: bool = False
+
+
+# Zero-width markers Word scatters between runs; they never split a sentence.
+MARKERS = {W+n for n in ("proofErr", "bookmarkStart", "bookmarkEnd", "permStart", "permEnd",
+                          "commentRangeStart", "commentRangeEnd")}
+RUN_MARKERS = {W+n for n in ("rPr", "lastRenderedPageBreak")}
+TOKEN = re.compile(r"\s+|\w+|[^\w\s]")
 
 
 def check(condition, message):
@@ -59,34 +67,87 @@ def word_blocks(root):
         style = ps.get(W+"val", "") if ps is not None else "Normal"
         if any(n.tag == W+"tc" for n in p.iterancestors()):
             style += " (table)"
-        pieces, assigned = [], set()
-        previous = None
-        group = []
-        def flush():
+        # A unit is the stretch of prose between protected elements (fields, links,
+        # tabs, breaks, notes). Formatting changes inside it become pieces of one unit,
+        # so a sentence with an italic phrase is translated whole.
+        units, pieces, group, assigned = [], [], [], set()
+        key = None
+        def flush_piece():
             if group:
-                pieces.append(Piece("".join(n.text or "" for n in group), tuple(group)))
+                pieces.append(Piece("".join(n.text or "" for n in group), tuple(group), key))
                 group.clear()
+        def flush_unit():
+            flush_piece()
+            if pieces:
+                units.append(list(pieces))
+                pieces.clear()
         # Revisions and content controls require their own layout-aware editing.
         locked = any(n.tag in (W+"ins", W+"del", W+"sdt", W+"moveFrom", W+"moveTo")
                      for n in list(p.iterancestors()) + list(p.iter()))
-        for run in p:
-            if locked or run.tag != W+"r":
-                flush()
-                previous = None
+        for run in ([] if locked else p):
+            if run.tag in MARKERS:
+                continue
+            if run.tag != W+"r":
+                flush_unit()
                 continue
             props = run.find(W+"rPr")
-            key = ET.tostring(props, method="c14n") if props is not None else b""
-            if key != previous:
-                flush()
-            previous = key
+            current = ET.tostring(props, method="c14n") if props is not None else b""
+            if current != key:
+                flush_piece()
+                key = current
             for child in run:
                 if child.tag == W+"t" and child not in fields:
                     group.append(child)
                     assigned.add(child)
-                elif child.tag != W+"rPr":
-                    flush()
-        flush()
-        yield Block(style, context, pieces, protected=any(n not in assigned for n in visible))
+                elif child.tag not in RUN_MARKERS:
+                    flush_unit()
+        flush_unit()
+        yield Block(style, context, units, protected=any(n not in assigned for n in visible))
+
+
+def tokens(text):
+    return TOKEN.findall(text)
+
+
+def distribute(pieces, new):
+    """Split new text over the original formatting pieces by aligning words.
+
+    Unchanged words keep their run. Rewritten or inserted words go to the run they
+    replace, or to the unit's dominant formatting when they straddle several runs.
+    """
+    from difflib import SequenceMatcher
+    weight = {}
+    for piece in pieces:
+        weight[piece.key] = weight.get(piece.key, 0) + len(piece.text.strip())
+    base = max(weight, key=weight.get)
+    old, owner = [], []
+    for i, piece in enumerate(pieces):
+        for tok in tokens(piece.text):
+            old.append(tok)
+            owner.append(i)
+    fresh = tokens(new)
+    out = ["" for _ in pieces]
+    def choose(candidates):
+        candidates = sorted(set(candidates))
+        if len(candidates) == 1:
+            return candidates[0]
+        preferred = [i for i in candidates if pieces[i].key == base]
+        return (preferred or candidates)[0]
+    for op, i1, i2, j1, j2 in SequenceMatcher(None, old, fresh, autojunk=False).get_opcodes():
+        if op == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                out[owner[i]] += fresh[j]
+            continue
+        if op == "delete":
+            continue
+        if i1 < i2:
+            target = choose(owner[i1:i2])
+        else:
+            around = [owner[k] for k in (i1-1, i1) if 0 <= k < len(old)]
+            target = choose(around) if around else 0
+        out[target] += "".join(fresh[j1:j2])
+    check("".join(out) == new, "Could not distribute the edited text over its runs")
+    return out
 
 
 class Manuscript:
@@ -104,7 +165,7 @@ class Manuscript:
             raw = path.read_bytes()
             self.encoding = "utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8"
             self.lines = raw.decode(self.encoding).splitlines(keepends=True)
-            self.blocks = [Block("text", line.rstrip("\r\n"), [Piece(line.rstrip("\r\n"))], i)
+            self.blocks = [Block("text", line.rstrip("\r\n"), [[Piece(line.rstrip("\r\n"))]], i)
                            for i, line in enumerate(self.lines) if line.strip()]
         else:
             raise ValueError("Use .docx or UTF-8 .txt; first save pasted prose as a local .txt")
@@ -113,20 +174,21 @@ class Manuscript:
         spans = {}
         for index in selection:
             b = self.blocks[index]
-            for j, piece in enumerate(b.pieces):
-                text = piece.text.strip()
+            for j, unit in enumerate(b.units):
+                text = "".join(piece.text for piece in unit).strip()
                 if text and any(c.isalpha() for c in text):
-                    spans[f"P{len(spans)+1:03d}"] = dict(block=index, piece=j, text=text)
+                    spans[f"P{len(spans)+1:03d}"] = dict(block=index, unit=j, text=text)
         check(spans, "The selection contains no editable prose; inspect protected formatting")
         return dict(sha256=self.fingerprint, blocks=selection, spans=spans)
 
     def replace(self, span, edited):
+        """Replace one unit and return formatted runs whose wording changed."""
         block = self.blocks[span["block"]]
-        piece = block.pieces[span["piece"]]
-        original = piece.text
+        unit = block.units[span["unit"]]
+        original = "".join(piece.text for piece in unit)
         check(original.strip() == span["text"], "Source text differs")
         if edited == span["text"]:
-            return
+            return []
         self.changed = True
         start = len(original) - len(original.lstrip())
         end = len(original.rstrip())
@@ -134,13 +196,23 @@ class Manuscript:
         if self.kind == ".txt":
             line = self.lines[block.line]
             self.lines[block.line] = new + line[len(original):]
-        else:
+            return []
+        parts = distribute(unit, new) if len(unit) > 1 else [new]
+        weight = {}
+        for piece in unit:
+            weight[piece.key] = weight.get(piece.key, 0) + len(piece.text.strip())
+        base = max(weight, key=weight.get)
+        review = []
+        for piece, text in zip(unit, parts):
+            if piece.key != base and text.strip() != piece.text.strip():
+                review.append((piece.text.strip(), text.strip()))
             first, *rest = piece.nodes
-            first.text = new
-            if new != new.strip():
+            first.text = text
+            if text != text.strip():
                 first.set(SPACE, "preserve")
             for n in rest:
                 n.text = ""
+        return review
 
     def write(self, path):
         check(path.suffix.lower() == self.kind, "Choose the same extension as the source")
@@ -225,7 +297,8 @@ def main():
         for k, span in scope["spans"].items():
             value = edits[k]
             check(isinstance(value, str) and value.strip() and not any(ch in value for ch in "\n\r\t"), f"Invalid text for {k}")
-            doc.replace(span, value.strip())
+            for before, after in doc.replace(span, value.strip()):
+                print(f"{k}: formatted run {before!r} now reads {after!r}; check its formatting")
         doc.write(args.output)
 
 

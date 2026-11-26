@@ -6,6 +6,8 @@
 
 普通稿先列出段落，再按章节与上下文选取编号。粘贴文字先原样保存为 UTF-8 TXT。纯正文可选 `--blocks all`。指定半句时用精确的起止位置和原格式编辑工具，不能直接选整段回填。
 
+Word 中每段按整句编号：斜体、加粗等格式变化和拼写标记、书签不再切开句子；只有域、超链接、制表符、换行、脚注引用等受保护元素才分隔编号。回填时未改动的词留在原格式中，新词跟随所替换的词或本段的主要格式。若带格式的词被改写，`merge` 会逐条提示，须在副本中核对该处格式。v1.0.0 准备的任务目录与新编号不兼容，请用新版重新 `prepare`。
+
 ```sh
 python scripts/manuscript.py list paper.docx
 python scripts/manuscript.py prepare paper.docx job --blocks B003-B005,B009

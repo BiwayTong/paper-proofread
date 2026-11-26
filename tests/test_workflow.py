@@ -122,6 +122,68 @@ class WorkflowTest(unittest.TestCase):
                 with self.subTest(service=service, highlights=highlights):
                     self.exercise(service, highlights)
 
+    def formatted_source(self):
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        source = self.root / "formatted.docx"
+        doc = Document()
+        p = doc.add_paragraph("Smith ")
+        p.add_run("et al.").italic = True
+        p.add_run(" found that teams ")
+        for tag, attrs in (("w:proofErr", {"w:type": "spellStart"}),
+                           ("w:bookmarkStart", {"w:id": "0", "w:name": "b"}),
+                           ("w:bookmarkEnd", {"w:id": "0"})):
+            marker = OxmlElement(tag)
+            for name, value in attrs.items():
+                marker.set(qn(name), value)
+            p._p.append(marker)
+        p.add_run("may leave.")
+        q = doc.add_paragraph("Before the tab.")
+        q.add_run().add_tab()
+        q.add_run("After the tab.")
+        doc.save(source)
+        return source
+
+    def test_formatted_runs_form_one_unit(self):
+        source = self.formatted_source()
+        job = self.root / "job"
+        call("manuscript", "prepare", source, job, "--blocks", "all")
+        # Formatting changes and Word's zero-width markers stay inside one unit;
+        # a tab is a protected element and still separates units.
+        self.assertEqual(read(job / "original.json"), {
+            "P001": "Smith et al. found that teams may leave.",
+            "P002": "Before the tab.",
+            "P003": "After the tab."})
+        write(job / "final.json", {"P001": "Smith et al. reported that both teams may depart.",
+                                   "P002": "Before the tab.", "P003": "After the tab."})
+        output = self.root / "revised.docx"
+        proc = call("manuscript", "merge", source, job, output)
+        self.assertNotIn("formatted run", proc.stdout)
+        paragraph = Document(output).paragraphs[0]
+        self.assertEqual(paragraph.text, "Smith et al. reported that both teams may depart.")
+        self.assertEqual([r.text for r in paragraph.runs if r.italic], ["et al."])
+        self.assertIn("w:proofErr", ZipFile(output).read("word/document.xml").decode())
+
+    def test_changed_formatted_run_is_reported(self):
+        source = self.formatted_source()
+        job = self.root / "job"
+        call("manuscript", "prepare", source, job, "--blocks", "B001")
+        write(job / "final.json", {"P001": "Smith and colleagues found that teams may leave."})
+        output = self.root / "revised.docx"
+        proc = call("manuscript", "merge", source, job, output)
+        self.assertIn("P001: formatted run 'et al.'", proc.stdout)
+        paragraph = Document(output).paragraphs[0]
+        self.assertEqual(paragraph.text, "Smith and colleagues found that teams may leave.")
+
+    def test_distribution_keeps_unchanged_words_in_their_runs(self):
+        import manuscript
+        pieces = [manuscript.Piece("The ", key=b""), manuscript.Piece("in vitro", key=b"i"),
+                  manuscript.Piece(" assay was run twice.", key=b"")]
+        self.assertEqual(manuscript.distribute(pieces, "The in vitro assay was repeated three times."),
+                         ["The ", "in vitro", " assay was repeated three times."])
+        self.assertEqual(manuscript.distribute(pieces, "In this study, the in vitro assay was run twice."),
+                         ["In this study, the ", "in vitro", " assay was run twice."])
+
     def test_automatic_channels_preserve_raw_output(self):
         sample = {"P001": "Two teams may leave."}
         for service in ("apple", "google"):
