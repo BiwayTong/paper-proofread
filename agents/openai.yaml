@@ -1,0 +1,4 @@
+interface:
+  display_name: "论文轻校对·通用版"
+  short_description: "按选区完成三轮英中往返翻译，尽量保留原句，可选第三轮表达复核"
+  default_prompt: "请使用 $paper-proofread 处理指定正文，完成三轮往返翻译并另存原始译文和定稿。"
