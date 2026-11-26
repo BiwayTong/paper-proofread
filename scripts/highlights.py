@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import unicodedata
 from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -15,6 +16,10 @@ from lxml import etree as ET
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 PART = "word/document.xml"
+W = "{%s}" % NS["w"]
+ANCHOR = 8       # characters a match needs before it is trusted on its own
+SLACK = 3000     # Word characters searched beyond each PDF page
+MIN_MATCHED = .9  # share of the Word body the PDF pages must reproduce
 
 
 def require(condition, message):
@@ -27,15 +32,49 @@ def sha(path):
 
 
 def normal(text):
-    return "".join(c for c in unicodedata.normalize("NFKC", text) if not c.isspace())
+    # Soft hyphens are invisible in Word unless a line breaks there.
+    return "".join(c for c in unicodedata.normalize("NFKC", text) if not c.isspace() and c != "\u00ad")
 
 
 def paragraphs(root):
-    return root.xpath("./w:body/w:p", namespaces=NS)
+    """Body paragraphs in reading order, table cells included, text boxes excluded."""
+    body = root.find(W+"body")
+    return [p for p in body.iter(W+"p") if not any(a.tag == W+"p" for a in p.iterancestors())]
 
 
 def text_nodes(paragraph):
-    return paragraph.xpath(".//w:t", namespaces=NS)
+    return [n for n in paragraph.iter(W+"t") if next(n.iterancestors(W+"p")) is paragraph]
+
+
+def runs(items, key):
+    """Group consecutive items that share key(item) into lists."""
+    out = []
+    for item in items:
+        if out and key(out[-1][-1], item):
+            out[-1].append(item)
+        else:
+            out.append([item])
+    return out
+
+
+def align(page_chars, word, pos):
+    """Map page characters to Word offsets at or after pos.
+
+    Text only the PDF shows (list numbers, footnotes, note markers, line-end hyphens)
+    and text only Word holds stay unmatched. A short match counts only when it
+    continues the Word text of the previous trusted match, so stray letters inside a
+    footnote or a reflowed table are never anchored.
+    """
+    window = word[pos:pos + len(page_chars) + SLACK]
+    blocks = SequenceMatcher(None, page_chars, window, autojunk=False).get_matching_blocks()
+    mapping, end = {}, None
+    for a, b, size in blocks:
+        if not size or (size < ANCHOR and b != end):
+            continue
+        for k in range(size):
+            mapping[a + k] = pos + b + k
+        end = b + size
+    return mapping
 
 
 def inspect(args):
@@ -59,7 +98,9 @@ def extract(args):
                 offsets.append((pi, index))
     full = "".join(chars)
     pos = 0
+    matched = set()
     selected = defaultdict(set)
+    unplaced = []
     with pdfplumber.open(args.pdf) as pdf:
         first, last = args.pages
         require(1 <= first <= last <= len(pdf.pages), "Invalid PDF page range")
@@ -71,23 +112,44 @@ def extract(args):
                      and len(r["non_stroking_color"]) == 3
                      and max(abs(a-b) for a, b in zip(r["non_stroking_color"], args.rgb)) <= .002]
             used = set()
-            for line in body.extract_text_lines(return_chars=True):
+            glyphs = []  # (normalized letter, line number, highlighted)
+            for ln, line in enumerate(body.extract_text_lines(return_chars=True)):
                 for glyph in line["chars"]:
-                    token = normal(glyph["text"])
-                    if not token:
-                        continue
-                    require(full.startswith(token, pos), f"PDF/Word text differs on page {page.page_number} near {line['text'][:65]!r}")
                     x = (glyph["x0"] + glyph["x1"]) / 2
                     y = (glyph["top"] + glyph["bottom"]) / 2
-                    for n, rect in enumerate(rects):
-                        if rect["x0"] <= x <= rect["x1"] and rect["top"] <= y <= rect["bottom"]:
-                            used.add(n)
-                            for address in offsets[pos:pos + len(token)]:
-                                selected[address].add(page.page_number)
-                    pos += len(token)
+                    hits = {n for n, rect in enumerate(rects)
+                            if rect["x0"] <= x <= rect["x1"] and rect["top"] <= y <= rect["bottom"]}
+                    used |= hits
+                    for letter in normal(glyph["text"]):
+                        glyphs.append((letter, ln, bool(hits)))
             require(len(used) == len(rects), f"Selected colour includes a rectangle without mapped text on page {page.page_number}")
-    require(pos == len(full), "The supplied pages do not reproduce the complete Word body")
-    require(selected, "No text under the chosen colour; inspect the PDF marking type and layout")
+            mapping = align("".join(g[0] for g in glyphs), full, pos)
+            if mapping:
+                pos = max(mapping.values()) + 1
+            matched.update(mapping.values())
+            for i, (_, _, hit) in enumerate(glyphs):
+                if hit and i in mapping:
+                    selected[offsets[mapping[i]]].add(page.page_number)
+            loose = [i for i, g in enumerate(glyphs) if g[2] and i not in mapping]
+            for group in runs(loose, lambda a, b: b == a + 1):
+                text = ""
+                for i in group:
+                    if text and glyphs[i][1] != glyphs[i-1][1]:
+                        text += " "
+                    text += glyphs[i][0]
+                # A lone line-end hyphen or stray mark carries no editable wording.
+                if any(c.isalnum() for c in text):
+                    unplaced.append(dict(page=page.page_number, text=text))
+    require(selected or unplaced, "No text under the chosen colour; inspect the PDF marking type and layout")
+    share = len(matched) / max(len(full), 1)
+    require(share >= MIN_MATCHED, f"The PDF pages reproduce only {share:.0%} of the Word body; "
+            "check the page range, body crop and that both files are the submitted version")
+    missing = [i for i in range(len(full)) if i not in matched]
+    word_only = []
+    for group in runs(missing, lambda a, b: b == a + 1 and offsets[a][0] == offsets[b][0]):
+        pi = offsets[group[0]][0]
+        a, b = offsets[group[0]][1], offsets[group[-1]][1] + 1
+        word_only.append(dict(paragraph=pi, start=a, end=b, text=texts[pi][a:b]))
     spans = []
     for (pi, index), pages in sorted(selected.items()):
         prev = spans[-1] if spans else None
@@ -99,10 +161,16 @@ def extract(args):
     for h in spans:
         h["text"] = texts[h["paragraph"]][h["start"]:h["end"]]
         h["pages"] = sorted(h["pages"])
-    manifest = dict(word_sha256=sha(args.word), pdf_sha256=sha(args.pdf), spans=spans)
+    manifest = dict(word_sha256=sha(args.word), pdf_sha256=sha(args.pdf), spans=spans,
+                    unplaced=unplaced, word_only=word_only)
     with args.output.open("x", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
-    print(f"{len(spans)} spans")
+    print(f"{len(spans)} spans; {share:.1%} of the Word body matched")
+    for item in unplaced:
+        print(f"Unplaced highlight on page {item['page']}: {item['text'][:65]!r}; locate it manually")
+    if word_only:
+        print(f"{len(word_only)} Word passages not found in the PDF are listed under word_only; "
+              "review them if a highlight sits near them")
 
 
 def merge(args):

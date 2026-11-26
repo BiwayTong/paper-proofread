@@ -27,13 +27,17 @@ def export(job, destination):
         with ZipFile(out, "w", ZIP_DEFLATED) as archive:
             for name in ("scope.json", "original.json", "baseline.json", "service.json", "review.md"):
                 archive.write(job/name, name)
-            spans = json.loads((job / "scope.json").read_text(encoding="utf-8"))["spans"]
+            scope = json.loads((job / "scope.json").read_text(encoding="utf-8"))
+            spans = scope["spans"]
             if isinstance(spans, list):
                 lines = ["# 选中的原文"]
                 for span in spans:
                     pages = ", ".join(str(p) for p in span.get("pages", []))
                     location = f" · PDF 页 {pages}" if pages else ""
                     lines.extend([f"## {span['id']}{location}", span["text"]])
+                if scope.get("unplaced"):
+                    lines.append("# 未能在 Word 中定位的标蓝文字")
+                    lines.extend(f"- PDF 页 {item['page']}：{item['text']}" for item in scope["unplaced"])
                 archive.writestr("highlights.md", "\n\n".join(lines) + "\n")
             for n in (1, 2, 3):
                 sections = []

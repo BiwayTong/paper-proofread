@@ -184,6 +184,71 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(manuscript.distribute(pieces, "In this study, the in vitro assay was run twice."),
                          ["In this study, the ", "in vitro", " assay was run twice."])
 
+    def test_highlights_survive_pdf_only_text_and_tables(self):
+        source = self.root / "submitted.docx"
+        doc = Document()
+        doc.add_paragraph("Teams may leave early in the season.", style="List Number")
+        doc.add_paragraph("The example shows a clear pattern in the data.")
+        cells = doc.add_table(rows=1, cols=2).rows[0].cells
+        cells[0].text, cells[1].text = "Alpha group", "Beta group"
+        doc.add_paragraph("The second sentence stays.")
+        doc.save(source)
+        pdf = self.root / "report.pdf"
+        page = Canvas(str(pdf), pagesize=(500, 700))
+        page.setFont("Helvetica", 12)
+        def draw(x, y, text, mark=False):
+            width = stringWidth(text, "Helvetica", 12)
+            if mark:
+                page.setFillColorRGB(0, .5, 1)
+                page.rect(x, y - 2, width, 14, stroke=0, fill=1)
+                page.setFillColorRGB(0, 0, 0)
+            page.drawString(x, y, text)
+            return x + width
+        # Word numbering, the hyphen at a line break, the note marker and the footnote
+        # appear only in the PDF; the table row is read across both cells.
+        draw(50, 640, "1. Teams may leave early in the season.")
+        draw(draw(50, 610, "The "), 610, "exam-", mark=True)
+        x = draw(50, 595, "ple shows", mark=True)
+        x = draw(draw(x, 595, " a clear pattern in the data."), 599, "1")
+        draw(draw(50, 565, "Alpha group "), 565, "Beta group", mark=True)
+        draw(50, 535, "The second sentence stays.")
+        draw(50, 80, "1 Survey archive, 2020.", mark=True)
+        page.save()
+        job = self.root / "job"
+        job.mkdir()
+        proc = call("highlights", "extract", pdf, source, job / "scope.json", "--pages", 1, 1,
+                    "--y", 10, 680, "--rgb", 0, .5, 1)
+        scope = read(job / "scope.json")
+        self.assertEqual([s["text"] for s in scope["spans"]], ["example shows", "Beta group"])
+        self.assertEqual(scope["unplaced"], [{"page": 1, "text": "1Surveyarchive,2020."}])
+        self.assertIn("Unplaced highlight on page 1", proc.stdout)
+        final = {"P001": "example reveals", "P002": "Beta cohort"}
+        write(job / "final.json", final)
+        output = self.root / "revised.docx"
+        call("highlights", "merge", source, job / "scope.json", job / "final.json", output)
+        revised = Document(output)
+        self.assertEqual(revised.paragraphs[1].text, "The example reveals a clear pattern in the data.")
+        self.assertEqual(revised.tables[0].rows[0].cells[1].text, "Beta cohort")
+        self.assertEqual(revised.paragraphs[0].text, "Teams may leave early in the season.")
+
+    def test_highlights_reject_a_different_document(self):
+        source = self.root / "submitted.docx"
+        doc = Document()
+        doc.add_paragraph("An entirely different manuscript about rivers and their floodplains.")
+        doc.save(source)
+        pdf = self.root / "report.pdf"
+        page = Canvas(str(pdf), pagesize=(500, 700))
+        page.setFillColorRGB(0, .5, 1)
+        page.rect(50, 598, 100, 15, stroke=0, fill=1)
+        page.setFillColorRGB(0, 0, 0)
+        page.setFont("Helvetica", 12)
+        page.drawString(50, 600, "Two teams may leave the league next season.")
+        page.save()
+        proc = call("highlights", "extract", pdf, source, self.root / "scope.json", "--pages", 1, 1,
+                    "--y", 10, 680, "--rgb", 0, .5, 1, ok=False)
+        self.assertIn("reproduce only", proc.stderr)
+        self.assertFalse((self.root / "scope.json").exists())
+
     def test_automatic_channels_preserve_raw_output(self):
         sample = {"P001": "Two teams may leave."}
         for service in ("apple", "google"):
