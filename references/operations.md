@@ -1,17 +1,19 @@
 # 运行与恢复
 
-从技能目录调用下列脚本，示例路径按实际文件调整。使用 Python 3.9 或以上。普通 TXT 和手动翻译表只需标准库；Word 需要 lxml，报告矩形提取还需要支持 `extract_text_lines` 的 pdfplumber。使用干净的任务目录，原件另存。安装文档依赖可在自己的 Python 环境中运行 `python -m pip install lxml 'pdfplumber>=0.10'`。
+从技能目录调用下列脚本，示例路径按实际文件调整。使用 Python 3.9 或以上。普通 TXT 和手动翻译表只需标准库；Word 需要 lxml，报告矩形提取还需要支持 `extract_text_lines` 的 pdfplumber。使用干净的任务目录，原件另存。安装文档依赖可在自己的 Python 环境中运行 `python -m pip install lxml 'pdfplumber>=0.10'`；运行 `tests/` 中的测试另需 `python-docx` 和 `reportlab`。输出文件在支持硬链接的磁盘上一步发布；U 盘（exFAT、FAT32）、部分网络盘或同步盘不支持时自动改为新建文件后复制，两种方式都不会覆盖已有文件。
 
 ## 准备选区
 
 普通稿先列出段落，再按章节与上下文选取编号。粘贴文字先原样保存为 UTF-8 TXT。纯正文可选 `--blocks all`。指定半句时用精确的起止位置和原格式编辑工具，不能直接选整段回填。
+
+Word 中每段按整句编号：斜体、加粗等格式变化和拼写标记、书签不再切开句子；只有域、超链接、制表符、换行、脚注引用等受保护元素才分隔编号。回填时未改动的词留在原格式中，新词跟随所替换的词或本段的主要格式。若带格式的词被改写，`merge` 会逐条提示，须在副本中核对该处格式。v1.0.0 准备的任务目录与新编号不兼容，请用新版重新 `prepare`。
 
 ```sh
 python scripts/manuscript.py list paper.docx
 python scripts/manuscript.py prepare paper.docx job --blocks B003-B005,B009
 ```
 
-标蓝报告先查看正文范围、填色和页边距。下例页码、高度和颜色须换为实际测得的值。程序处理填色矩形，逐字核对整篇 Word；仅有批注、扫描件或复杂版面时，人工核实图面与 Word 精确位置后再处理。遇到歧义时保留原句并标出位置。
+标蓝报告先查看正文范围、填色和页边距。下例页码、高度和颜色须换为实际测得的值。程序处理填色矩形，把每页文字与整篇 Word（含表格）对齐。只在 PDF 中出现的自动编号、脚注、注释角标和行尾连字符会被跳过；PDF 页面须覆盖至少 90% 的 Word 正文，否则视为版本或页码范围不符而停止。无法可靠对齐的标蓝文字（如脚注中或表格换行错位处）不会生成编号，而是列在 `scope.json` 的 `unplaced` 中并逐条打印，须人工定位后另行处理；Word 中有、PDF 中没有的文字列在 `word_only`，标蓝处靠近这些位置时请复核。仅有批注、扫描件或复杂版面时，人工核实图面与 Word 精确位置后再处理。遇到歧义时保留原句并标出位置。
 
 ```sh
 mkdir job
@@ -35,7 +37,7 @@ python scripts/highlights.py extract report.pdf submitted.docx job/scope.json --
 
 苹果快捷指令应接收文本，调用苹果的「翻译文本」动作，返回普通文本；为两个方向分别指定真实的快捷指令名称，先用短句核实语言方向。Google Cloud 需已启用 Cloud Translation 的项目，在本地设置 `GOOGLE_TRANSLATE_API_KEY`，或安装 `google-auth[requests]` 并配置应用默认凭据。用户选择网页方式时直接打开实际的 [Google 翻译网页](https://translate.google.com/)。
 
-手动方式对 Apple 和 Google 均可用。导出后，按表中方向逐段把 `source` 交给所选服务，完整原样填入对应 `translation`。导入使用 `--import-form r1-zh.json` 替代导出参数，保留轮次、方向、服务与源文。仅导入真实取得、来源已确认的译文。命令会保存已返回的编号，列出尚缺的编号。再次运行同一步可接续进度，每个方向使用独立表名。
+手动方式对 Apple 和 Google 均可用。导出后，按表中方向逐段把 `source` 交给所选服务，完整原样填入对应 `translation`。导入使用 `--import-form r1-zh.json` 替代导出参数，保留轮次、方向、服务与源文。用 `--via` 如实写明译文来源：Google 为 `web`（翻译网页，默认）或 `cloud`（用户自己在 Cloud 项目中取得），苹果为 `app`（默认）。来源会写入每条记录。仅导入真实取得、来源已确认的译文。命令会保存已返回的编号，列出尚缺的编号。再次运行同一步可接续进度，每个方向使用独立表名。
 
 1. 完成英译中后，从 `r1-zh-raw.json` 另存中文调整稿 `r1-zh-edit.json`，保持全部编号，并在记录中标明作者稿或建议稿。
 2. 将命令中的 `zh` 换为 `en`；快捷指令换为中译英，手动表换为 `r1-en.json`。程序读取本轮中文调整稿，取得英文回译后写入 `r1-en-raw.json`。对照基准稿纠正偏移，再写 `r1-en-edit.json`。
@@ -43,7 +45,7 @@ python scripts/highlights.py extract report.pdf submitted.docx job/scope.json --
 
 ## 回填及打包
 
-最后对照检查稿写为 `job/check.json`，最小校对后的定稿写为 `job/final.json`。两者编号与基准稿相同。先回填原件副本，核对正文、修改边界、样式和引用域。普通 Word 自动保留域、链接等保护元素；跨格式或未能自动处理的局部选区按原格式精确编辑并核对。只有摘录时直接交付编号定稿。
+最后对照检查稿写为 `job/check.json`，最小校对后的定稿写为 `job/final.json`。两者编号与基准稿相同。先回填原件副本，核对正文、修改边界、样式和引用域。普通 Word 自动保留域、链接等保护元素。标蓝回填时，同段中的引用域、超链接和修订痕迹不影响其余文字；标蓝处本身跨越斜体等格式时按词对齐分回原格式，被改写的带格式词会逐条提示。标蓝处与域结果、超链接、修订或内容控件重叠时，命令会停止，须按原格式人工编辑并核对。只有摘录时直接交付编号定稿。
 
 ```sh
 # 普通稿
