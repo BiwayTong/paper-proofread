@@ -3,7 +3,6 @@ import argparse
 import copy
 import hashlib
 import json
-import os
 import shutil
 import tempfile
 import unicodedata
@@ -13,6 +12,8 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from lxml import etree as ET
+from fileops import publish_file
+from manuscript import Piece, SPACE, distribute
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 PART = "word/document.xml"
@@ -44,6 +45,24 @@ def paragraphs(root):
 
 def text_nodes(paragraph):
     return [n for n in paragraph.iter(W+"t") if next(n.iterancestors(W+"p")) is paragraph]
+
+
+def field_results(root):
+    """Text nodes shown as the result of a complex field such as a citation."""
+    fields, depth = set(), 0
+    for n in root.iter():
+        if n.tag == W+"fldChar":
+            kind = n.get(W+"fldCharType")
+            depth += int(kind == "begin") - int(kind == "end")
+        if depth and n.tag == W+"t":
+            fields.add(n)
+    return fields
+
+
+def run_key(node):
+    run = node.getparent()
+    props = run.find(W+"rPr") if run is not None and run.tag == W+"r" else None
+    return ET.tostring(props, method="c14n") if props is not None else b""
 
 
 def runs(items, key):
@@ -183,6 +202,7 @@ def merge(args):
     with ZipFile(args.word) as doc:
         root = ET.fromstring(doc.read(PART))
         ps = paragraphs(root)
+        fields = field_results(root)
         previous = None
         changed = 0
         # Reverse order keeps earlier offsets stable when replacement lengths change.
@@ -198,18 +218,37 @@ def merge(args):
             require(before[a:b] == s["text"] and b <= len(before), f"Original span differs at {s['id']}")
             if val == s["text"]:
                 continue
-            require(not ps[pi].xpath(".//w:fldChar | .//w:fldSimple | .//w:ins | .//w:del", namespaces=NS),
-                    f"{s['id']} intersects a paragraph with fields or tracked changes; use formatting-aware editing")
-            cursor = 0
+            # Only the text the span touches must be plain run text; citation fields,
+            # links and tracked changes elsewhere in the paragraph stay untouched.
+            touched, cursor = [], 0
             for node in nodes:
                 t = node.text or ""
-                if cursor <= a and b <= cursor + len(t):
-                    require(not node.xpath("ancestor::w:hyperlink", namespaces=NS), f"{s['id']} is a hyperlink; inspect manually")
-                    node.text = t[:a-cursor] + val + t[b-cursor:]
-                    break
+                lo, hi = max(a, cursor), min(b, cursor + len(t))
+                if lo < hi:
+                    touched.append((node, lo - cursor, hi - cursor))
                 cursor += len(t)
+            for node, _, _ in touched:
+                require(node not in fields and not node.xpath(
+                    "ancestor::w:fldSimple | ancestor::w:hyperlink | ancestor::w:ins | ancestor::w:moveTo"
+                    " | ancestor::w:sdt", namespaces=NS),
+                    f"{s['id']} overlaps a field, link, tracked change or content control; edit it manually")
+            if len(touched) == 1:
+                node, lo, hi = touched[0]
+                node.text = node.text[:lo] + val + node.text[hi:]
             else:
-                raise ValueError(f"{s['id']} spans multiple Word text nodes; preserve their formatting with a run-aware edit")
+                pieces = [Piece(node.text[lo:hi], key=run_key(node)) for node, lo, hi in touched]
+                parts = distribute(pieces, val)
+                for (node, lo, hi), piece, part in zip(touched, pieces, parts):
+                    node.text = node.text[:lo] + part + node.text[hi:]
+                    if node.text != node.text.strip():
+                        node.set(SPACE, "preserve")
+                weight = Counter()
+                for piece in pieces:
+                    weight[piece.key] += len(piece.text.strip())
+                base = weight.most_common(1)[0][0]
+                for piece, part in zip(pieces, parts):
+                    if piece.key != base and part.strip() != piece.text.strip():
+                        print(f"{s['id']}: formatted run {piece.text.strip()!r} now reads {part.strip()!r}; check its formatting")
             require("".join(n.text or "" for n in nodes) == before[:a]+val+before[b:], "Unexpected paragraph edit")
             changed += 1
         with tempfile.TemporaryDirectory(dir=args.output.parent) as tmp:
@@ -228,7 +267,7 @@ def merge(args):
                 require(sha(staged) == scope["word_sha256"], "Base Word file changed")
                 with ZipFile(staged) as check:
                     require(check.testzip() is None, "Invalid output archive")
-            os.link(staged, args.output)  # publish only after validation; existing files are never overwritten
+            publish_file(staged, args.output)  # publish only after validation; existing files are never overwritten
     print(f"{changed} of {len(spans)} verified spans changed")
 
 

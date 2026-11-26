@@ -4,12 +4,12 @@ import copy
 from dataclasses import dataclass
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import shutil
 import tempfile
 from zipfile import ZipFile
+from fileops import publish_file
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 DOC = "word/document.xml"
@@ -237,7 +237,7 @@ class Manuscript:
                         check(out.testzip() is None and src.namelist() == out.namelist(), "Invalid output archive")
                         for name in src.namelist():
                             check(out.read(name) == (payload if name == DOC else src.read(name)), f"Unexpected change: {name}")
-            os.link(staged, path)  # Existing manuscripts and completed outputs are never overwritten.
+            publish_file(staged, path)  # Existing manuscripts and completed outputs are never overwritten.
 
 
 def selected(spec, size):

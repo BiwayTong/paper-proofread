@@ -249,6 +249,117 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("reproduce only", proc.stderr)
         self.assertFalse((self.root / "scope.json").exists())
 
+    def cited_source(self):
+        """A paragraph with an italic phrase and a Zotero-style citation field."""
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        source = self.root / "cited.docx"
+        doc = Document()
+        p = doc.add_paragraph("Teams ")
+        p.add_run("in situ").italic = True
+        p.add_run(" may leave early ")
+        def field_run(kind=None, instr=None, text=None):
+            run = p.add_run(text or "")
+            if kind:
+                mark = OxmlElement("w:fldChar")
+                mark.set(qn("w:fldCharType"), kind)
+                run._r.append(mark)
+            if instr:
+                code = OxmlElement("w:instrText")
+                code.text = instr
+                run._r.append(code)
+        field_run("begin")
+        field_run(instr=" ADDIN ZOTERO_ITEM CSL_CITATION {} ")
+        field_run("separate")
+        field_run(text="(Smith, 2020)")
+        field_run("end")
+        p.add_run(".")
+        doc.save(source)
+        return source
+
+    def marked_report(self, line, marked):
+        pdf = self.root / "cited.pdf"
+        page = Canvas(str(pdf), pagesize=(500, 700))
+        start = line.index(marked)
+        x = 50 + stringWidth(line[:start], "Helvetica", 12)
+        page.setFillColorRGB(0, .5, 1)
+        page.rect(x, 598, stringWidth(marked, "Helvetica", 12), 15, stroke=0, fill=1)
+        page.setFillColorRGB(0, 0, 0)
+        page.setFont("Helvetica", 12)
+        page.drawString(50, 600, line)
+        page.save()
+        return pdf
+
+    def test_highlight_merge_beside_citation_field_and_across_runs(self):
+        source = self.cited_source()
+        line = "Teams in situ may leave early (Smith, 2020)."
+        job = self.root / "job"
+        job.mkdir()
+        call("highlights", "extract", self.marked_report(line, "Teams in situ may leave"), source,
+             job / "scope.json", "--pages", 1, 1, "--y", 10, 680, "--rgb", 0, .5, 1)
+        self.assertEqual([s["text"] for s in read(job / "scope.json")["spans"]], ["Teams in situ may leave"])
+        write(job / "final.json", {"P001": "Teams in situ may depart"})
+        output = self.root / "revised.docx"
+        proc = call("highlights", "merge", source, job / "scope.json", job / "final.json", output)
+        self.assertNotIn("formatted run", proc.stdout)
+        paragraph = Document(output).paragraphs[0]
+        self.assertEqual(paragraph.text, "Teams in situ may depart early (Smith, 2020).")
+        self.assertEqual([r.text for r in paragraph.runs if r.italic], ["in situ"])
+        self.assertIn("ZOTERO_ITEM", ZipFile(output).read("word/document.xml").decode())
+
+    def test_highlight_merge_refuses_to_edit_a_field_result(self):
+        source = self.cited_source()
+        line = "Teams in situ may leave early (Smith, 2020)."
+        job = self.root / "job"
+        job.mkdir()
+        call("highlights", "extract", self.marked_report(line, "early (Smith"), source,
+             job / "scope.json", "--pages", 1, 1, "--y", 10, 680, "--rgb", 0, .5, 1)
+        write(job / "final.json", {"P001": "soon (Smith"})
+        proc = call("highlights", "merge", source, job / "scope.json", job / "final.json",
+                    self.root / "revised.docx", ok=False)
+        self.assertIn("overlaps a field", proc.stderr)
+        self.assertFalse((self.root / "revised.docx").exists())
+
+    def test_manual_import_records_its_channel(self):
+        job = self.root / "job"
+        job.mkdir()
+        write(job / "scope.json", {"spans": [{"id": "P001", "text": "Two teams may leave."}]})
+        write(job / "baseline.json", {"P001": "Two teams may leave."})
+        form = self.root / "form.json"
+        cmd = ["rounds", job, 1, "zh", "--provider", "google"]
+        call(*cmd, "--export-form", form)
+        call(*cmd, "--export-form", self.root / "other.json", "--via", "cloud", ok=False)
+        table = read(form)
+        table["paragraphs"]["P001"]["translation"] = "两支队伍可能离开。"
+        write(form, table)
+        self.assertIn("must be one of", call(*cmd, "--import-form", form, "--via", "app", ok=False).stderr)
+        call(*cmd, "--import-form", form, "--via", "cloud")
+        record = read(job / ".records" / "r1-zh" / "P001.json")
+        self.assertEqual(record["provider"], rounds.CLOUD_MANUAL)
+        self.assertTrue(rounds.verify_record(record, "Two teams may leave.", "zh", "google"))
+        self.assertFalse(rounds.verify_record(record, "Two teams may leave.", "zh", "apple"))
+
+    def test_publish_without_hard_links(self):
+        import errno
+        import os
+        import fileops
+        staged = self.root / "staged"
+        staged.write_text("verified")
+        target = self.root / "target"
+        with patch.object(os, "link", side_effect=OSError(errno.EPERM, "no hard links")):
+            fileops.publish_file(staged, target)
+            self.assertEqual(target.read_text(), "verified")
+            staged.write_text("newer")
+            with self.assertRaises(FileExistsError):
+                fileops.publish_file(staged, target)
+            self.assertEqual(target.read_text(), "verified")
+            # Translation records use the same path and stay immutable.
+            record = self.root / "record.json"
+            rounds.publish(record, {"output": "a"})
+            rounds.publish(record, {"output": "a"})
+            with self.assertRaises(ValueError):
+                rounds.publish(record, {"output": "b"})
+
     def test_automatic_channels_preserve_raw_output(self):
         sample = {"P001": "Two teams may leave."}
         for service in ("apple", "google"):

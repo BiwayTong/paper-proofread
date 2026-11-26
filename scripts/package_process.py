@@ -2,11 +2,11 @@
 import argparse
 import html
 import json
-import os
 from pathlib import Path
 import tempfile
 from zipfile import ZipFile, ZIP_DEFLATED
 from rounds import read_texts, selection, verify_record
+from fileops import publish_file
 
 
 def export(job, destination):
@@ -78,7 +78,7 @@ def export(job, destination):
         with ZipFile(out) as archive:
             if archive.testzip():
                 raise ValueError("Invalid process ZIP")
-        os.link(out,destination)
+        publish_file(out, destination)
 
 
 if __name__ == "__main__":

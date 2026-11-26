@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import urllib.error
 import urllib.request
+from fileops import publish_file
 
 ENDPOINT = "https://translation.googleapis.com/language/translate/v2"
 LANGUAGES = {"zh": ("en", "zh-CN"), "en": ("zh-CN", "en")}
@@ -16,6 +17,9 @@ API_PROVIDER = "google-cloud-translation-v2"
 WEB_PROVIDER = "google-translate-web"
 APPLE_SHORTCUT = "apple-shortcut"
 APPLE_MANUAL = "apple-manual-user-attested"
+CLOUD_MANUAL = "google-cloud-translation-user-supplied"
+# Where a hand-returned translation came from: --via value -> recorded provider.
+MANUAL = {"apple": {"app": APPLE_MANUAL}, "google": {"web": WEB_PROVIDER, "cloud": CLOUD_MANUAL}}
 
 
 def digest(text):
@@ -37,7 +41,7 @@ def publish(path, data):
         staged = Path(folder)/"new"
         staged.write_text(payload, encoding="utf-8")
         try:
-            os.link(staged, path)
+            publish_file(staged, path)
         except FileExistsError:
             if json.loads(path.read_text(encoding="utf-8")) != data:
                 raise ValueError(f"Conflicting record at {path}; use a new job folder for revised inputs") from None
@@ -133,7 +137,7 @@ def apple_translate(text, shortcut):
 
 def verify_record(rec, source, direction, service):
     src, dst = LANGUAGES[direction]
-    channels = {"apple": (APPLE_SHORTCUT, APPLE_MANUAL), "google": (API_PROVIDER, WEB_PROVIDER)}
+    channels = {"apple": (APPLE_SHORTCUT, APPLE_MANUAL), "google": (API_PROVIDER, WEB_PROVIDER, CLOUD_MANUAL)}
     return (isinstance(rec, dict) and rec.get("provider") in channels[service]
             and (rec.get("source_language"), rec.get("target_language")) == (src, dst)
             and rec.get("input_sha256") == digest(source)
@@ -170,6 +174,13 @@ def run(args):
     job = args.job
     if args.shortcut and args.provider != "apple" or args.cloud and args.provider != "google":
         raise ValueError("Use --shortcut with Apple or --cloud with Google")
+    via = getattr(args, "via", None)
+    if via and not args.import_form:
+        raise ValueError("--via describes an imported form; use it with --import-form")
+    channels = MANUAL[args.provider]
+    if via and via not in channels:
+        raise ValueError(f"--via for {args.provider} must be one of: {', '.join(channels)}")
+    manual_channel = channels[via or next(iter(channels))]
     original = selection(job)
     base = read_texts(job / "baseline.json")
     ids = set(base)
@@ -209,7 +220,7 @@ def run(args):
                         continue
                     if args.import_form:
                         result = manual[key]
-                        channel = APPLE_MANUAL if args.provider == "apple" else WEB_PROVIDER
+                        channel = manual_channel
                     elif args.shortcut:
                         result = apple_translate(value, args.shortcut)
                         channel = APPLE_SHORTCUT
@@ -250,6 +261,9 @@ if __name__ == "__main__":
     mode.add_argument("--cloud", action="store_true", help="Use the configured Google Cloud Translation project")
     mode.add_argument("--export-form", type=Path, help="Write the current numbered inputs for manual translation")
     mode.add_argument("--import-form", type=Path, help="Import raw results from the chosen translation service")
+    parser.add_argument("--via", choices=("app", "web", "cloud"),
+                        help="Where imported results came from: Apple app (default for Apple); "
+                             "Google web page (default for Google) or the user's own Google Cloud project")
     try:
         args = parser.parse_args()
         run(args)
